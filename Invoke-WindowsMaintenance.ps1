@@ -87,9 +87,10 @@ function Split-List([string[]]$Value) {
     @($Value | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ })
 }
 
-$Only = Split-List $Only
-$Skip = Split-List $Skip
-$WingetExclude = Split-List $WingetExclude
+# @() evita que una lista vacía se convierta en $null (StrictMode no permite $null.Count).
+$Only = @(Split-List $Only)
+$Skip = @(Split-List $Skip)
+$WingetExclude = @(Split-List $WingetExclude)
 
 foreach ($name in $Only + $Skip) {
     if ($AllSteps -notcontains $name) {
@@ -299,7 +300,7 @@ function Invoke-Native {
     $stdErr = $errTask.Result
     $text = $output.ToString()
 
-    $clean = ConvertTo-CleanLines ($text + "`n" + $stdErr)
+    $clean = @(ConvertTo-CleanLines ($text + "`n" + $stdErr))
     if ($clean.Count) { Add-Content -LiteralPath $LogFile -Value ($clean | ForEach-Object { "    $_" }) -Encoding UTF8 -ErrorAction SilentlyContinue }
     Write-Log ("< código de salida {0} ({1})" -f $proc.ExitCode, (Format-Elapsed $clock.Elapsed)) -Level Detail -LogOnly
 
