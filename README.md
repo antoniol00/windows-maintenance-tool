@@ -1,6 +1,23 @@
 # windows-maintenance-tool
 
-Script de PowerShell para hacer un mantenimiento completo de Windows 11 **a demanda**, con barra de progreso global y por paso, y un registro de todo lo que hace.
+Script de PowerShell para hacer un mantenimiento completo de Windows 11 **a demanda**, con un comecocos animado que muestra el progreso, y un registro de todo lo que hace.
+
+```
+               .------------------------------------.
+               | Revisando la imagen de Windows...  |
+               '------------------------------------'
+                     \
+      .-"""-.      .-'''-.
+     / o   o \    /   o .-'
+    |         |  |     <     .  .  .  .  .  .  .  .  .  O
+    |         |   \     '-.
+    |/\/\/\/\/|    '-...-'
+=============================================================
+  40% |  Paso 4 de 9: DISM (imagen de Windows) (62%)
+  > Reparando imagen (RestoreHealth...) 62%  (00:03:12)
+```
+
+El comecocos avanza según el progreso total comiéndose la "basura", perseguido por un fantasma (que huye asustado durante el análisis de Defender). Debajo se ven el paso actual y los últimos mensajes. La animación va en un hilo aparte, así que sigue moviéndose aunque un paso tarde mucho.
 
 ## Qué hace
 
@@ -31,6 +48,7 @@ Desde PowerShell:
 .\Invoke-WindowsMaintenance.ps1 -WingetExclude Microsoft.Edge     # no actualizar ciertas apps
 .\Invoke-WindowsMaintenance.ps1 -TempOlderThanDays 0              # borrar todos los temporales
 .\Invoke-WindowsMaintenance.ps1 -Reboot -NoPause                  # desatendido, reinicia si hace falta
+.\Invoke-WindowsMaintenance.ps1 -NoAnimation                      # barra de progreso clásica, sin comecocos
 ```
 
 Si PowerShell bloquea el script por la directiva de ejecución, usa el `.cmd` o lánzalo así:
@@ -45,5 +63,6 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-WindowsMaintenance.ps1
 - **Registro:** cada ejecución deja un log en `logs\mantenimiento_AAAAMMDD_HHMMSS.log`, con la salida completa de DISM, SFC y winget.
 - **Liberador de espacio:** por seguridad **no** se limpian la carpeta de Descargas, la Papelera, `Windows.old`, los archivos ESD de reinstalación ni el Historial de archivos. Se puede cambiar en la variable `$CleanMgrExclude` al principio del script.
 - **winget:** si el script se ejecuta dentro de Windows Terminal, no actualiza Windows Terminal (cerraría la ventana). `App Installer` (el propio winget) se actualiza el último.
+- **Animación:** se dibuja en la pantalla alternativa de la consola; al terminar se vuelve a la normal y se muestran todos los mensajes y el resumen. Si la consola no admite secuencias VT (o en PowerShell ISE), se usa la barra de progreso clásica automáticamente.
 - **Suspensión:** el equipo no entra en suspensión mientras dura el mantenimiento.
 - Requiere Windows 10/11 y Windows PowerShell 5.1 (incluido en Windows). También funciona en PowerShell 7.

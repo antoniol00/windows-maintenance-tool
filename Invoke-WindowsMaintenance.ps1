@@ -36,6 +36,9 @@
 .PARAMETER NoPause
     No espera a que se pulse Enter al terminar (útil para tareas programadas).
 
+.PARAMETER NoAnimation
+    Usa la barra de progreso clásica de PowerShell en lugar del comecocos animado.
+
 .EXAMPLE
     .\Invoke-WindowsMaintenance.ps1
 
@@ -53,7 +56,8 @@ param(
     [int]$TempOlderThanDays = 1,
     [string[]]$WingetExclude = @(),
     [switch]$Reboot,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [switch]$NoAnimation
 )
 
 Set-StrictMode -Version 2.0
@@ -135,6 +139,20 @@ try { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 catch { $LogDir = $env:ProgramData }
 $LogFile = Join-Path $LogDir ('mantenimiento_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
 
+# Estado compartido con la animación mientras está en marcha ($null si no hay animación).
+$Dashboard = $null
+
+function Get-LevelColor([string]$Level) {
+    switch ($Level) {
+        'Ok'     { 'Green' }
+        'Warn'   { 'Yellow' }
+        'Error'  { 'Red' }
+        'Title'  { 'Cyan' }
+        'Detail' { 'DarkGray' }
+        default  { 'Gray' }
+    }
+}
+
 function Write-Log {
     param(
         [string]$Message = '',
@@ -143,17 +161,10 @@ function Write-Log {
         [switch]$LogOnly
     )
     try { Add-Content -LiteralPath $LogFile -Value ('[{0:HH:mm:ss}] [{1}] {2}' -f (Get-Date), $Level, $Message) -Encoding UTF8 } catch { }
-    if (-not $LogOnly) {
-        $color = switch ($Level) {
-            'Ok'     { 'Green' }
-            'Warn'   { 'Yellow' }
-            'Error'  { 'Red' }
-            'Title'  { 'Cyan' }
-            'Detail' { 'DarkGray' }
-            default  { 'Gray' }
-        }
-        Write-Host $Message -ForegroundColor $color
-    }
+    if ($LogOnly) { return }
+    # Con la animación activa, los mensajes se muestran debajo del dibujo.
+    if ($Dashboard) { [void]$Dashboard.Log.Add(@{ Text = $Message; Level = $Level }); return }
+    Write-Host $Message -ForegroundColor (Get-LevelColor $Level)
 }
 
 function Format-Size([double]$Bytes) {
@@ -205,8 +216,181 @@ function Test-PendingReboot {
 }
 
 # ---------------------------------------------------------------------------
-# Barra de progreso (Id 1 = global, Id 2 = paso actual)
+# Progreso: comecocos animado (o barra clásica con -NoAnimation)
 # ---------------------------------------------------------------------------
+
+# Construye un fotograma de la animación como lista de líneas (con colores VT
+# salvo que se pida -Plain). Se ejecuta en el hilo de la animación.
+function Get-DashboardFrame {
+    param($UI, [int]$Frame, [int]$Width, [int]$Height, [switch]$Plain)
+
+    $e = [char]27
+    $w = [Math]::Max(20, $Width - 1)
+    $h = [Math]::Max(8, $Height)
+    $paint = { param([string]$Code, [string]$Text) if ($Plain -or -not $Text) { $Text } else { "$e[${Code}m$Text$e[0m" } }
+    $fit = {
+        param([string]$Text, [int]$Max)
+        if ($Text.Length -le $Max) { return $Text }
+        if ($Max -le 3) { return $Text.Substring(0, [Math]::Max(0, $Max)) }
+        $Text.Substring(0, $Max - 3) + '...'
+    }
+
+    # Comecocos: boca cerrada, entreabierta y abierta.
+    $pacFrames = @(
+        @("  .-'''-.  ", " /   o   \ ", "|         |", " \       / ", "  '-...-'  "),
+        @("  .-'''-.  ", " /   o  .' ", "|      <   ", " \      '. ", "  '-...-'  "),
+        @("  .-'''-.  ", " /   o .-' ", "|     <    ", " \     '-. ", "  '-...-'  ")
+    )
+    $ghostBody = @('  .-"""-.  ', ' / o   o \ ', '|         |', '|         |')
+    $scaredBody = @('  .-"""-.  ', ' /  o o  \ ', '|         |', '| /\/\/\/ |')
+    $skirts = @('|/\/\/\/\/|', '|\/\/\/\/\|')
+
+    $phrases = @{
+        ''            = @('Calentando motores...')
+        RestorePoint  = @('Guardando una copia por si acaso...', 'Más vale prevenir que formatear', 'Foto del sistema... ¡patata!')
+        Temp          = @('¡Ñam! Temporales para desayunar', 'Cuánta basura en %TEMP%...', 'Archivos viejos... ¡a la tripa!')
+        CleanMgr      = @('Sacando la basura de Windows', 'Esto va a dejar sitio, ya verás', 'Liberando gigas como quien no quiere la cosa')
+        DISM          = @('Revisando la imagen de Windows...', 'Si me quedo parado en un %, tranquilo', 'DISM piensa despacio, pero piensa bien')
+        SFC           = @('Contando los tornillos del sistema', 'Mirando debajo de la alfombra...', '¿Falta algún archivo? Yo lo encuentro')
+        WindowsUpdate = @('Preguntando a Microsoft qué hay de nuevo', 'Parches recién salidos del horno', 'Esto puede tardar... ¿un café?')
+        Winget        = @('Poniendo al día tus aplicaciones', '¡Versiones nuevas para todos!', 'Actualizando app por app...')
+        Defender      = @('¡A cazar bichos!', 'Ningún virus pasa de aquí', 'Ahora el fantasma huye de MÍ')
+        Optimize      = @('Ordenando los bits del disco', 'Pasando la mopa al SSD', 'Recolocando bytes, uno a uno')
+        Done          = @('¡Terminado! Tu PC brilla como nuevo')
+    }
+
+    $pct = [int][Math]::Max(0, [Math]::Min(100, $UI.Overall))
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $title = ' MANTENIMIENTO DE WINDOWS '
+    $clock = '{0:hh\:mm\:ss} ' -f $UI.Clock.Elapsed
+    $pad = $w - $title.Length - $clock.Length
+    if ($pad -ge 1) { $lines.Add((& $paint '30;103' $title) + (' ' * $pad) + (& $paint 90 $clock)) }
+    else { $lines.Add((& $paint '30;103' (& $fit $title $w))) }
+
+    # El comecocos recorre la pantalla según el progreso total, con el fantasma detrás.
+    $trackStart = 16
+    $trackEnd = $w - 11
+    if ($trackEnd -gt $trackStart -and $h -ge 12) {
+        $pacX = $trackStart + [int][Math]::Floor(($trackEnd - $trackStart) * $pct / 100)
+        $gap = 2 + [int]([Math]::Floor($Frame / 3) % 3)
+        $ghostX = $pacX - 11 - $gap
+
+        if ($h -ge 18) {
+            $key = if ($UI.Done) { 'Done' } else { [string]$UI.StepId }
+            if (-not $phrases.ContainsKey($key)) { $key = '' }
+            $list = $phrases[$key]
+            $say = & $fit $list[[int][Math]::Floor($UI.Clock.Elapsed.TotalSeconds / 7) % $list.Count] ($w - 4)
+            $bubbleWidth = $say.Length + 4
+            $indent = ' ' * [Math]::Max(0, [Math]::Min($pacX - 2, $w - $bubbleWidth))
+            $lines.Add('')
+            $lines.Add($indent + (& $paint 97 ('.' + ('-' * ($bubbleWidth - 2)) + '.')))
+            $lines.Add($indent + (& $paint 97 '| ') + (& $paint '1;97' $say) + (& $paint 97 ' |'))
+            $lines.Add($indent + (& $paint 97 ("'" + ('-' * ($bubbleWidth - 2)) + "'")))
+            $lines.Add((' ' * ($pacX + 4)) + (& $paint 97 '\'))
+        }
+
+        $mouth = @(0, 1, 2, 1)[$Frame % 4]
+        $scared = $UI.Done -or $UI.StepId -eq 'Defender'
+        $ghostRows = $(if ($scared) { $scaredBody } else { $ghostBody }) + $skirts[[int][Math]::Floor($Frame / 2) % 2]
+        $ghostColor = if ($scared) { 94 } else { @(91, 95, 96, 33)[[Math]::Max(0, $UI.StepIndex - 1) % 4] }
+
+        # La "basura" que queda por comer, con una pastilla parpadeante al final.
+        $dots = New-Object System.Text.StringBuilder
+        for ($col = $pacX + 11; $col -lt $w; $col++) {
+            if ($col -eq $w - 2) { [void]$dots.Append($(if ([Math]::Floor($Frame / 4) % 2) { ' ' } else { 'O' })) }
+            elseif ($col % 3 -eq 0) { [void]$dots.Append('.') }
+            else { [void]$dots.Append(' ') }
+        }
+
+        for ($i = 0; $i -lt 5; $i++) {
+            $row = (' ' * $ghostX) + (& $paint $ghostColor $ghostRows[$i]) + (' ' * $gap) + (& $paint 93 $pacFrames[$mouth][$i])
+            if ($i -eq 2) { $row += & $paint 97 $dots.ToString() }
+            $lines.Add($row)
+        }
+        $lines.Add((& $paint 94 ('=' * $w)))
+    }
+
+    $stepText = if ($UI.Done) { '¡Mantenimiento completado!' } else { 'Paso {0} de {1}: {2}' -f $UI.StepIndex, $UI.StepCount, $UI.StepName }
+    if (-not $UI.Done -and $UI.StepPercent -ge 0) { $stepText += " ($($UI.StepPercent)%)" }
+    $head = "  $pct% "
+    $lines.Add((& $paint '1;93' $head) + (& $paint 97 (& $fit "|  $stepText" ($w - $head.Length))))
+    $lines.Add((& $paint 37 (& $fit "  > $($UI.Status)" $w)))
+    $lines.Add((& $paint 90 ('-' * $w)))
+
+    # Últimos mensajes del registro, debajo del dibujo.
+    $room = $h - $lines.Count - 1
+    if ($room -gt 0) {
+        $levelColors = @{ Ok = 92; Warn = 93; Error = 91; Title = 96; Detail = 90; Info = 37 }
+        $count = $UI.Log.Count
+        for ($i = [Math]::Max(0, $count - $room); $i -lt $count; $i++) {
+            $entry = $UI.Log[$i]
+            $lines.Add((& $paint $levelColors[$entry.Level] (& $fit $entry.Text $w)))
+        }
+    }
+    , $lines.ToArray()
+}
+
+# Bucle del hilo de la animación: dibuja ~8 fotogramas por segundo en la pantalla
+# alternativa de la consola, independientemente de lo que esté haciendo el script.
+$DashboardLoop = {
+    $e = [char]27
+    $frame = 0
+    while ($UI.Running) {
+        try {
+            $lines = Get-DashboardFrame -UI $UI -Frame $frame -Width ([Console]::WindowWidth) -Height ([Console]::WindowHeight)
+            $out = New-Object System.Text.StringBuilder
+            [void]$out.Append("$e[?2026h")
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                [void]$out.Append("$e[$($i + 1);1H").Append($lines[$i]).Append("$e[0m$e[K")
+            }
+            [void]$out.Append("$e[$($lines.Count + 1);1H$e[J$e[?2026l")
+            [WinMaintenance.Native]::Write($out.ToString())
+        }
+        catch { }
+        $frame++
+        Start-Sleep -Milliseconds 120
+    }
+}
+
+function Start-Dashboard {
+    if ($NoAnimation -or -not $NativeReady -or $Host.Name -ne 'ConsoleHost') { return $null }
+    try {
+        if ([Console]::IsOutputRedirected -or -not [WinMaintenance.Native]::EnableVirtualTerminal()) { return $null }
+        $state = [hashtable]::Synchronized(@{
+                Running     = $true
+                Done        = $false
+                Overall     = 0
+                StepPercent = -1
+                Status      = 'Preparando...'
+                StepId      = ''
+                StepName    = 'Preparando'
+                StepIndex   = 0
+                StepCount   = $Run.StepCount
+                Clock       = $Run.Clock
+                Log         = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+            })
+        # El hilo recibe el código como texto para que no dependa de este runspace.
+        $code = "param(`$UI)`nfunction Get-DashboardFrame {`n$(${function:Get-DashboardFrame})`n}`n$DashboardLoop"
+        $state.PowerShell = [PowerShell]::Create()
+        [void]$state.PowerShell.AddScript($code).AddArgument($state)
+        [WinMaintenance.Native]::Write("$([char]27)[?1049h$([char]27)[?25l")   # pantalla alternativa, sin cursor
+        $state.Handle = $state.PowerShell.BeginInvoke()
+        return $state
+    }
+    catch { return $null }
+}
+
+function Stop-Dashboard {
+    if (-not $Dashboard) { return }
+    $state = $Dashboard
+    $script:Dashboard = $null
+    $state.Running = $false
+    try { [void]$state.Handle.AsyncWaitHandle.WaitOne(3000); $state.PowerShell.Dispose() } catch { }
+    [WinMaintenance.Native]::Write("$([char]27)[?25h$([char]27)[?1049l")
+    # Se vuelcan a la consola normal los mensajes que se mostraron durante la animación.
+    foreach ($entry in $state.Log) { Write-Host $entry.Text -ForegroundColor (Get-LevelColor $entry.Level) }
+}
 
 $Run = @{
     Clock       = [Diagnostics.Stopwatch]::StartNew()
@@ -226,12 +410,19 @@ function Set-StepProgress {
     )
     $fraction = if ($Percent -ge 0) { [Math]::Min(100, $Percent) / 100 } else { 0 }
     $overall = [int][Math]::Min(100, ($Run.DoneWeight + $Run.StepWeight * $fraction) / $Run.TotalWeight * 100)
+    if (-not $Status) { $Status = 'Trabajando...' }
+
+    if ($Dashboard) {
+        $Dashboard.Overall = $overall
+        $Dashboard.StepPercent = $(if ($Percent -ge 0) { [Math]::Min(100, $Percent) } else { -1 })
+        $Dashboard.Status = $Status
+        return
+    }
 
     Write-Progress -Id 1 -Activity 'Mantenimiento de Windows' `
         -Status ('Paso {0} de {1}: {2}  |  {3}% total  |  {4}' -f $Run.StepIndex, $Run.StepCount, $Run.StepName, $overall, (Format-Elapsed $Run.Clock.Elapsed)) `
         -PercentComplete $overall
 
-    if (-not $Status) { $Status = 'Trabajando...' }
     $child = @{ Id = 2; ParentId = 1; Activity = $Run.StepName; Status = $Status }
     if ($Percent -ge 0) { $child.PercentComplete = [Math]::Min(100, $Percent) }
     Write-Progress @child
@@ -720,13 +911,31 @@ $freeAtStart = Get-FreeSpace
 
 try { $Host.UI.RawUI.WindowTitle = 'Mantenimiento de Windows' } catch { }
 
-# Evita que el equipo entre en suspensión mientras dura el mantenimiento.
-$keepAwake = $false
+# Funciones nativas: evitar la suspensión y escribir en la consola desde el hilo de la animación.
+$NativeReady = $false
 try {
-    Add-Type -Namespace WinMaintenance -Name Power -MemberDefinition `
-        '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);'
-    [void][WinMaintenance.Power]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16))   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-    $keepAwake = $true
+    Add-Type -Namespace WinMaintenance -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint esFlags);
+[DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr hConsole, out uint mode);
+[DllImport("kernel32.dll")] static extern bool SetConsoleMode(IntPtr hConsole, uint mode);
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+static extern bool WriteConsoleW(IntPtr hConsole, string text, uint length, out uint written, IntPtr reserved);
+
+public static bool EnableVirtualTerminal() {
+    IntPtr handle = GetStdHandle(-11);
+    uint mode;
+    if (!GetConsoleMode(handle, out mode)) return false;
+    return SetConsoleMode(handle, mode | 0x0004);
+}
+
+public static void Write(string text) {
+    uint written;
+    WriteConsoleW(GetStdHandle(-11), text, (uint)text.Length, out written, IntPtr.Zero);
+}
+'@
+    $NativeReady = $true
+    [void][WinMaintenance.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000001', 16))   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
 }
 catch { }
 
@@ -739,12 +948,21 @@ Write-Log ("Pasos: {0}" -f (($selected | ForEach-Object { $StepDefs[$_].Name }) 
 Write-Log ("Espacio libre en {0}: {1}" -f $env:SystemDrive, (Format-Size $freeAtStart))
 Write-Log "Registro: $LogFile" -Level Detail
 
+$Dashboard = Start-Dashboard
+# Las barras de progreso de otros comandos se pintarían encima de la animación.
+if ($Dashboard) { $ProgressPreference = 'SilentlyContinue' }
+
 try {
     foreach ($id in $selected) {
         $def = $StepDefs[$id]
         $Run.StepIndex++
         $Run.StepName = $def.Name
         $Run.StepWeight = $def.Weight
+        if ($Dashboard) {
+            $Dashboard.StepId = $id
+            $Dashboard.StepName = $def.Name
+            $Dashboard.StepIndex = $Run.StepIndex
+        }
 
         Write-Log ''
         Write-Log ("[{0}/{1}] {2}" -f $Run.StepIndex, $Run.StepCount, $def.Name) -Level Title
@@ -771,11 +989,21 @@ try {
                 Detalle  = $result.Detail
             })
     }
+
+    if ($Dashboard) {
+        # Celebración final: el comecocos llega a la meta y el fantasma huye.
+        $Dashboard.Overall = 100
+        $Dashboard.Status = 'Mantenimiento completado'
+        $Dashboard.Done = $true
+        Start-Sleep -Seconds 4
+    }
 }
 finally {
+    Stop-Dashboard
+    $ProgressPreference = 'Continue'
     Write-Progress -Id 2 -Activity 'Paso' -Completed
     Write-Progress -Id 1 -Activity 'Mantenimiento de Windows' -Completed
-    if ($keepAwake) { [void][WinMaintenance.Power]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) }
+    if ($NativeReady) { [void][WinMaintenance.Native]::SetThreadExecutionState([Convert]::ToUInt32('80000000', 16)) }
 }
 
 # ---------------------------------------------------------------------------
